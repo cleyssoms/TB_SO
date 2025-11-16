@@ -24,6 +24,105 @@ import java.util.*;
 
 public class Sistema {
 
+    // ------------------- ESTADOS DO PROCESSO -------------------
+    public enum ProcessState {
+        NEW, READY, RUNNING, BLOCKED, TERMINATED
+    }
+
+    // ------------------- PROCESS CONTROL BLOCK (PCB) -------------------
+    public class PCB {
+        public int id;
+        public int pc;
+        public int[] reg;
+        public int[] tabelaPaginas;
+        public ProcessState estado;
+        public String programName;
+
+        private static int nextId = 0;
+
+        public PCB(int[] _tabelaPaginas, String _programName) {
+            this.id = nextId++;
+            this.tabelaPaginas = _tabelaPaginas;
+            this.programName = _programName;
+            this.pc = 0; // Ponto de entrada LÓGICO é sempre 0
+            this.reg = new int[10]; // Registradores zerados
+            Arrays.fill(this.reg, 0);
+            this.estado = ProcessState.NEW;
+        }
+    }
+
+    // ------------------- GERENTE DE PROCESSOS -------------------
+    public class GerenteProcessos {
+        public LinkedList<PCB> prontos;
+        public PCB rodando;
+        private GerenteMemoria gm;
+        private HW hw;
+        private int tamPg;
+        private Utilities utils;
+
+        public GerenteProcessos(HW _hw, GerenteMemoria _gm, int _tamPg, Utilities _utils) {
+            this.hw = _hw;
+            this.gm = _gm;
+            this.tamPg = _tamPg;
+            this.utils = _utils;
+            this.prontos = new LinkedList<>();
+            this.rodando = null;
+        }
+
+        public boolean criaProcesso(Program p) {
+            if (p == null || p.image == null) {
+                System.out.println("GP: Erro: Programa nulo.");
+                return false;
+            }
+            int nroPalavras = p.image.length;
+            int[] tabelaPaginas = gm.aloca(nroPalavras);
+            if (tabelaPaginas == null) {
+                System.out.println("GP: Erro: Memória insuficiente para o programa " + p.name);
+                return false;
+            }
+            PCB pcb = new PCB(tabelaPaginas, p.name);
+            carregarPrograma(p.image, pcb);
+            pcb.estado = ProcessState.READY;
+            prontos.add(pcb);
+            System.out.println("GP: Processo " + pcb.id + " (" + pcb.programName + ") criado.");
+            return true;
+        }
+
+        private void carregarPrograma(Word[] programa, PCB pcb) {
+            for (int endLogico = 0; endLogico < programa.length; endLogico++) {
+                int pagina = endLogico / tamPg;
+                int offset = endLogico % tamPg;
+                int frame = pcb.tabelaPaginas[pagina];
+                int endFisico = (frame * tamPg) + offset;
+                hw.mem.pos[endFisico] = new Word(programa[endLogico].opc, programa[endLogico].ra, programa[endLogico].rb, programa[endLogico].p);
+            }
+            System.out.println("GP: Carga do programa " + pcb.programName + " concluída.");
+        }
+
+        public void desalocaProcesso(int id) {
+            // Procura o PCB na fila de prontos
+            PCB pcb = null;
+            for (PCB p : prontos) {
+                if (p.id == id) {
+                    pcb = p;
+                    break;
+                }
+            }
+            if (rodando != null && rodando.id == id) {
+                System.out.println("GP: Erro: Não pode desalocar processo rodando.");
+                return;
+            }
+            if (pcb == null) {
+                System.out.println("GP: Processo " + id + " não encontrado.");
+                return;
+            }
+            prontos.remove(pcb);
+            gm.desaloca(pcb.tabelaPaginas);
+            pcb.estado = ProcessState.TERMINATED;
+            System.out.println("GP: Processo " + id + " desalocado.");
+        }
+    }
+
     // -------------------------------------------------------------------------------------------------------
     // --------------------- H A R D W A R E - definicoes de HW
     // ----------------------------------------------
@@ -479,26 +578,28 @@ public class Sistema {
     // ------------------- I N T E R R U P C O E S - rotinas de tratamento
     // ----------------------------------
     public class InterruptHandling {
-        private HW hw; // referencia ao hw se tiver que setar algo
+        private SO so;
 
-        public InterruptHandling(HW _hw) {
-            hw = _hw;
+        public InterruptHandling(SO _so) {
+            so = _so;
         }
 
         public void handle(Interrupts irpt) {
             // apenas avisa - todas interrupcoes neste momento finalizam o programa
             System.out.println(
-                    "                                                         Interrupcao " + irpt + "   pc: " + hw.cpu.pc);
+                    "                                                         Interrupcao " + irpt + "   pc: " + so.hw.cpu.pc);
         }
     }
 
     // ------------------- C H A M A D A S D E S I S T E M A - rotinas de tratamento
     // ----------------------
     public class SysCallHandling {
-        private HW hw; // referencia ao hw se tiver que setar algo
+        private HW hw;
+        private SO so;
 
-        public SysCallHandling(HW _hw) {
+        public SysCallHandling(HW _hw, SO _so) {
             hw = _hw;
+            so = _so;
         }
 
         public void stop() { // chamada de sistema indicando final de programa
@@ -602,12 +703,16 @@ public class Sistema {
         public InterruptHandling ih;
         public SysCallHandling sc;
         public Utilities utils;
+        public GerenteProcessos gp;
+        public HW hw;
 
-        public SO(HW hw, GerenteMemoria gm) {
-            ih = new InterruptHandling(hw); // rotinas de tratamento de int
-            sc = new SysCallHandling(hw); // chamadas de sistema
-            hw.cpu.setAddressOfHandlers(ih, sc);
+        public SO(HW hw, GerenteMemoria gm, int tamPg) {
+            this.hw = hw;
             utils = new Utilities(hw, gm);
+            gp = new GerenteProcessos(hw, gm, tamPg, utils);
+            ih = new InterruptHandling(this);
+            sc = new SysCallHandling(hw, this);
+            hw.cpu.setAddressOfHandlers(ih, sc);
         }
     }
     // -------------------------------------------------------------------------------------------------------
@@ -624,7 +729,7 @@ public class Sistema {
         this.tamPagina = _tamPagina;
         hw = new HW(tamMem, _tamPagina);           // memoria do HW tem tamMem palavras
         gerenteMem = new GerenteMemoria(tamMem, _tamPagina);
-        so = new SO(hw, gerenteMem);
+        so = new SO(hw, gerenteMem, _tamPagina);
         hw.cpu.setUtilities(so.utils); // permite cpu fazer dump de memoria ao avancar
         progs = new Programs();
     }
