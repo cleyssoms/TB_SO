@@ -3,8 +3,10 @@
 // Código fornecido como parte da solução do projeto de Sistemas Operacionais
 
 import java.util.*;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.LinkedBlockingQueue;
 
-public class Sistema implements Runnable {
+public class Sistema {
 
     // ------------------- ESTADOS DO PROCESSO -------------------
     public enum ProcessState {
@@ -33,21 +35,38 @@ public class Sistema implements Runnable {
         }
     }
 
+    // ------------------- CLASSE IORequest -------------------
+    public class IORequest {
+        public PCB pcb;
+        public int endLogico;
+        public int tipo;
+
+        public IORequest(PCB _pcb, int _endLogico, int _tipo) {
+            this.pcb = _pcb;
+            this.endLogico = _endLogico;
+            this.tipo = _tipo;
+        }
+    }
+
     // ------------------- GERENTE DE PROCESSOS -------------------
     public class GerenteProcessos {
         public LinkedList<PCB> prontos;
+        public LinkedList<PCB> bloqueados; // Nova fila de bloqueados
         public PCB rodando;
         private GerenteMemoria gm;
         private HW hw;
         private int tamPg;
         private Utilities utils;
+        private SO so;
 
-        public GerenteProcessos(HW _hw, GerenteMemoria _gm, int _tamPg, Utilities _utils) {
+        public GerenteProcessos(HW _hw, GerenteMemoria _gm, int _tamPg, Utilities _utils, SO _so) {
             this.hw = _hw;
             this.gm = _gm;
             this.tamPg = _tamPg;
             this.utils = _utils;
+            this.so = _so;
             this.prontos = new LinkedList<>();
+            this.bloqueados = new LinkedList<>();
             this.rodando = null;
         }
 
@@ -67,6 +86,11 @@ public class Sistema implements Runnable {
             pcb.estado = ProcessState.READY;
             prontos.add(pcb);
             System.out.println("GP: Processo " + pcb.id + " (" + pcb.programName + ") criado.");
+            
+            // Se for o primeiro processo, libera o escalonador
+            if (rodando == null && prontos.size() == 1) {
+                so.semaEscalonador.release();
+            }
             return true;
         }
 
@@ -85,26 +109,38 @@ public class Sistema implements Runnable {
             // Procura o PCB na fila de prontos
             PCB pcb = null;
 
-			if (rodando != null && rodando.id == id) {
-				pcb = rodando;
-				rodando = null;
-				System.out.println("GP: Desalocando processo rodando " + id);
-			} 
-			else {
-            	Iterator<PCB> iterator = prontos.iterator();
-				while (iterator.hasNext()) {
-					PCB p = iterator.next();
-					if (p.id == id) {
-						pcb = p;
-						iterator.remove();
-						System.out.println("GP: Desalocando processo da fila " + id);
-						break;
-					}
-				}
-			}
-			
+            if (rodando != null && rodando.id == id) {
+                pcb = rodando;
+                rodando = null;
+                System.out.println("GP: Desalocando processo rodando " + id);
+            } 
+            else {
+                Iterator<PCB> iterator = prontos.iterator();
+                while (iterator.hasNext()) {
+                    PCB p = iterator.next();
+                    if (p.id == id) {
+                        pcb = p;
+                        iterator.remove();
+                        System.out.println("GP: Desalocando processo da fila " + id);
+                        break;
+                    }
+                }
+                
+                // Se não encontrou nos prontos, procura nos bloqueados
+                if (pcb == null) {
+                    iterator = bloqueados.iterator();
+                    while (iterator.hasNext()) {
+                        PCB p = iterator.next();
+                        if (p.id == id) {
+                            pcb = p;
+                            iterator.remove();
+                            System.out.println("GP: Desalocando processo bloqueado " + id);
+                            break;
+                        }
+                    }
+                }
+            }
             
-            // REMOVIDA a verificação de processo rodando - agora é tratado antes
             if (pcb == null) {
                 System.out.println("GP: Processo " + id + " não encontrado.");
                 return;
@@ -112,6 +148,18 @@ public class Sistema implements Runnable {
             gm.desaloca(pcb.tabelaPaginas);
             pcb.estado = ProcessState.TERMINATED;
             System.out.println("GP: Processo " + id + " desalocado.");
+        }
+
+        public PCB findAndRemoveFromBlocked(int pid) {
+            Iterator<PCB> iterator = bloqueados.iterator();
+            while (iterator.hasNext()) {
+                PCB p = iterator.next();
+                if (p.id == pid) {
+                    iterator.remove();
+                    return p;
+                }
+            }
+            return null;
         }
 
         public void ps() {
@@ -123,7 +171,10 @@ public class Sistema implements Runnable {
             for (PCB p : prontos) {
                 System.out.println(p.id + "\tREADY\t\t" + p.programName);
             }
-            if (rodando == null && prontos.isEmpty()) {
+            for (PCB p : bloqueados) {
+                System.out.println(p.id + "\tBLOCKED\t\t" + p.programName);
+            }
+            if (rodando == null && prontos.isEmpty() && bloqueados.isEmpty()) {
                 System.out.println("Nenhum processo ativo.");
             }
         }
@@ -137,6 +188,14 @@ public class Sistema implements Runnable {
                     if (p.id == id) {
                         pcb = p;
                         break;
+                    }
+                }
+                if (pcb == null) {
+                    for (PCB p : bloqueados) {
+                        if (p.id == id) {
+                            pcb = p;
+                            break;
+                        }
                     }
                 }
             }
@@ -158,21 +217,21 @@ public class Sistema implements Runnable {
         }
 
         public void escalonar() {
-			prontos.removeIf(p -> p.estado == ProcessState.TERMINATED);
+            prontos.removeIf(p -> p.estado == ProcessState.TERMINATED);
 
             if (prontos.isEmpty()) {
                 rodando = null;
-				System.out.println("GP: Todos os processos terminaram. Retornando ao CLI.");
+                System.out.println("GP: Todos os processos terminaram. Retornando ao CLI.");
                 return;
             }
             
             PCB proximo = prontos.removeFirst();
 
-			if (proximo.estado == ProcessState.TERMINATED) {
-				System.out.println("GP: Processo " + proximo.id + " já terminado. Pulando...");
-				escalonar();
-				return;
-			}
+            if (proximo.estado == ProcessState.TERMINATED) {
+                System.out.println("GP: Processo " + proximo.id + " já terminado. Pulando...");
+                escalonar();
+                return;
+            }
 
             proximo.estado = ProcessState.RUNNING;
             rodando = proximo;
@@ -182,11 +241,11 @@ public class Sistema implements Runnable {
             
             System.out.println("GP: Escalonando processo " + rodando.id + " (" + rodando.programName + ")");
 
-			if (prontos.isEmpty() && rodando == null) {
-				System.out.println("\n=== TODOS OS PROCESSOS TERMINARAM ===");
-				System.out.println("Retornando ao prompt de comandos...");
-				System.out.print("> "); // Para manter a formatação do CLI
-			}
+            if (prontos.isEmpty() && rodando == null) {
+                System.out.println("\n=== TODOS OS PROCESSOS TERMINARAM ===");
+                System.out.println("Retornando ao prompt de comandos...");
+                System.out.print("> "); // Para manter a formatação do CLI
+            }
         }
 
         public void exec(int id) {
@@ -251,7 +310,7 @@ public class Sistema implements Runnable {
     }
 
     public enum Interrupts {           // possiveis interrupcoes que esta CPU gera
-        noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow, intFimDeFatiaDeTempo;
+        noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow, intFimDeFatiaDeTempo, intIO;
     }
 
     // ------------------- GERENTE DE MEMÓRIA COM PAGINAÇÃO -------------------
@@ -332,6 +391,10 @@ public class Sistema implements Runnable {
         private int instrucoesExecutadas = 0;
         private final int DELTA_INSTRUCOES = 4; // Quantum de 4 instruções
 
+        // Mecanismo para interrupção de E/S
+        private volatile boolean ioInterruptPending = false;
+        private volatile int ioProcessId = -1;
+
         public CPU(Memory _mem, boolean _debug, int _tamPg) { // ref a MEMORIA passada na criacao da CPU
             maxInt = 32767;            // capacidade de representacao modelada
             minInt = -32767;           // se exceder deve gerar interrupcao de overflow
@@ -366,6 +429,15 @@ public class Sistema implements Runnable {
 
         public int[] getReg() {
             return reg;
+        }
+
+        public synchronized void setIOInterrupt(int pid) {
+            ioInterruptPending = true;
+            ioProcessId = pid;
+        }
+
+        public int getPendingIOProcessId() {
+            return ioProcessId;
         }
 
         private int translate(int logicalAddress) {
@@ -422,6 +494,12 @@ public class Sistema implements Runnable {
 
         public void run_one_instruction() {                               // execucao da CPU de UMA instrução
             cpuStop = false;
+            
+            // Verifica interrupção de E/S pendente
+            if (ioInterruptPending) {
+                irpt = Interrupts.intIO;
+                ioInterruptPending = false;
+            }
             
             // --------------------------------------------------------------------------------------------------
             // FASE DE FETCH
@@ -676,6 +754,71 @@ public class Sistema implements Runnable {
     // ------------------- SW - inicio - Sistema Operacional
     // -------------------------------------------------
 
+    // ------------------- THREADS DO SISTEMA -------------------
+
+    public class ThreadEscalonador implements Runnable {
+        @Override
+        public void run() {
+            while(true) {
+                try {
+                    so.semaEscalonador.acquire(); // (1) Aguarda liberação (do Timer, STOP, Chamada IO, ou GP)
+                    PCB proximo = so.gp.prontos.pollFirst(); // Pega o primeiro da fila de prontos
+                    if (proximo != null) {
+                        proximo.estado = ProcessState.RUNNING;
+                        so.gp.rodando = proximo;
+                        hw.cpu.setContext(proximo.pc, proximo.reg, proximo.tabelaPaginas); // (2) Restaura estado na CPU
+                        so.semaCPU.release(); // (3) Libera a ThreadCPU para executar
+                    } else {
+                        // Fila de prontos vazia. O sistema fica ocioso.
+                        so.gp.rodando = null;
+                    }
+                } catch (InterruptedException e) { e.printStackTrace(); }
+            }
+        }
+    }
+
+    public class ThreadCPU implements Runnable {
+        @Override
+        public void run() {
+            while(true) {
+                try {
+                    so.semaCPU.acquire(); // (1) Aguarda liberação do Escalonador
+                    while (so.gp.rodando != null) { // Loop da fatia de tempo
+                        hw.cpu.run_one_instruction(); // (2) Executa uma instrução
+                        // 'run_one_instruction' detecta interrupções (Timer, IO, Falha) e chama 'ih.handle()'
+                        // 'ih.handle()' (ou 'sc.handle()') irá setar 'so.gp.rodando = null' e liberar o Escalonador,
+                        // quebrando este loop 'while' e fazendo a ThreadCPU voltar a aguardar em (1).
+                    }
+                } catch (InterruptedException e) { e.printStackTrace(); }
+            }
+        }
+    }
+
+    public class ThreadConsole implements Runnable {
+        @Override
+        public void run() {
+            while(true) {
+                try {
+                    IORequest req = so.filaPedidosConsole.take(); // (1) Aguarda pedido na fila (bloqueante)
+                    PCB pcb = req.pcb;
+                    int endFisico = hw.cpu.translate(req.endLogico);
+                    // (2) Simula E/S (DMA)
+                    if (req.tipo == 1) { // IN (Leitura)
+                        System.out.print("    > CONSOLE INPUT (para pid: " + pcb.id + ", end: " + req.endLogico + "): ");
+                        Scanner s = new Scanner(System.in); // SIMULAÇÃO: Scanner do console
+                        int valor = s.nextInt();
+                        hw.mem.pos[endFisico].p = valor;
+                        hw.mem.pos[endFisico].opc = Opcode.DATA;
+                    } else if (req.tipo == 2) { // OUT (Escrita)
+                        System.out.println("    > CONSOLE OUTPUT (de pid: " + pcb.id + ", end: " + req.endLogico + "): " + hw.mem.pos[endFisico].p);
+                    }
+                    // (3) Simula fim da E/S e gera interrupção
+                    hw.cpu.setIOInterrupt(pcb.id);
+                } catch (InterruptedException e) { e.printStackTrace(); }
+            }
+        }
+    }
+
     // ------------------- I N T E R R U P C O E S - rotinas de tratamento
     // ----------------------------------
     public class InterruptHandling {
@@ -688,27 +831,33 @@ public class Sistema implements Runnable {
         public void handle(Interrupts irpt) {
             switch (irpt) {
                 case intFimDeFatiaDeTempo:
-                    PCB anterior = so.gp.rodando;
-                    if (anterior != null) {
-                        // Salvar contexto no PCB
-                        anterior.pc = so.hw.cpu.getPc();
-                        // Registradores já estão salvos por referência
-                        anterior.estado = ProcessState.READY;
-                        // Devolver para o FIM da fila
-                        so.gp.prontos.addLast(anterior);
-                        System.out.println("IH: Preempção - Processo " + anterior.id + " retorna para fila");
+                    PCB processoAtual = so.gp.rodando;
+                    processoAtual.pc = hw.cpu.getPc(); // Salva PC
+                    processoAtual.estado = ProcessState.READY;
+                    so.gp.prontos.addLast(processoAtual); // Põe no FIM da fila de prontos
+                    so.gp.rodando = null;
+                    so.semaEscalonador.release(); // Libera o Escalonador
+                    break;
+                    
+                case intIO:
+                    int pid = hw.cpu.getPendingIOProcessId();
+                    PCB pcb = so.gp.findAndRemoveFromBlocked(pid);
+                    if (pcb != null) {
+                        pcb.estado = ProcessState.READY;
+                        so.gp.prontos.addLast(pcb); // Põe no FIM da fila de prontos
+                        System.out.println("    > INT IO: Processo " + pcb.id + " desbloqueado -> READY.");
                     }
-                    so.gp.escalonar();
+                    // IMPORTANTE: NÃO libera o escalonador. O processo 'rodando' atual continua.
                     break;
                     
                 case intEnderecoInvalido:
                 case intInstrucaoInvalida:
                 case intOverflow:
-                    System.out.println("!!!! ERRO FATAL no Processo " + so.gp.rodando.id + ": " + irpt);
+                    System.out.println("!!!! INTERRUPÇÃO FATAL: " + irpt + " no Processo " + so.gp.rodando.id);
                     PCB processoComErro = so.gp.rodando;
                     so.gp.rodando = null;
                     so.gp.desalocaProcesso(processoComErro.id);
-                    so.gp.escalonar();
+                    so.semaEscalonador.release();
                     break;
                     
                 default:
@@ -734,21 +883,28 @@ public class Sistema implements Runnable {
             PCB processoTerminado = so.gp.rodando;
             so.gp.rodando = null;
             so.gp.desalocaProcesso(processoTerminado.id);
-            so.gp.escalonar();
+            so.semaEscalonador.release(); // Libera o Escalonador para trocar o processo
         }
 
         public void handle() { // chamada de sistema 
-                               // suporta somente IO, com parametros 
-                               // reg[8] = in ou out    e reg[9] endereco do inteiro
-            System.out.println("SYSCALL pars:  " + hw.cpu.reg[8] + " / " + hw.cpu.reg[9]);
-
-            if  (hw.cpu.reg[8]==1){
-                   // leitura ...
-
-            } else if (hw.cpu.reg[8]==2){
-                   // escrita - escreve o conteuodo da memoria na posicao dada em reg[9]
-                   System.out.println("OUT:   "+ hw.mem.pos[hw.cpu.reg[9]].p);
-            } else {System.out.println("  PARAMETRO INVALIDO"); }       
+            PCB processoAtual = so.gp.rodando;
+            processoAtual.pc = hw.cpu.getPc(); // Salva o PC atual (instrução *após* a syscall)
+            int tipoChamada = hw.cpu.reg[8];
+            if (tipoChamada == 1 || tipoChamada == 2) { // CHAMADA DE E/S (IN ou OUT)
+                System.out.println("    > TRAP: Processo " + processoAtual.id + " solicitou E/S.");
+                processoAtual.estado = ProcessState.BLOCKED;
+                so.gp.bloqueados.add(processoAtual);
+                so.gp.rodando = null;
+                int endLogico = hw.cpu.reg[9];
+                so.filaPedidosConsole.add(new IORequest(processoAtual, endLogico, tipoChamada));
+                so.semaConsole.release(); // Libera a ThreadConsole para processar o pedido
+                so.semaEscalonador.release(); // Libera o Escalonador para trocar o processo
+            } else {
+                // Chamada de sistema desconhecida (exceto STOP, que é tratado separadamente)
+                System.out.println("    > TRAP: Chamada de sistema inválida: " + tipoChamada);
+                // Tratar como interrupção fatal
+                so.ih.handle(Interrupts.intInstrucaoInvalida);
+            }       
         }
     }
 
@@ -836,13 +992,29 @@ public class Sistema implements Runnable {
         public GerenteProcessos gp;
         public HW hw;
 
+        // Estruturas de sincronização
+        public Semaphore semaCPU = new Semaphore(0);
+        public Semaphore semaEscalonador = new Semaphore(0);
+        public Semaphore semaConsole = new Semaphore(0);
+        public LinkedBlockingQueue<IORequest> filaPedidosConsole = new LinkedBlockingQueue<>();
+
+        // Threads do sistema
+        public ThreadEscalonador escalonador;
+        public ThreadCPU cpuThread;
+        public ThreadConsole console;
+
         public SO(HW hw, GerenteMemoria gm, int tamPg) {
             this.hw = hw;
             utils = new Utilities(hw, gm);
-            gp = new GerenteProcessos(hw, gm, tamPg, utils);
+            gp = new GerenteProcessos(hw, gm, tamPg, utils, this);
             ih = new InterruptHandling(this);
             sc = new SysCallHandling(hw, this);
             hw.cpu.setAddressOfHandlers(ih, sc);
+            
+            // Instanciar as threads
+            escalonador = new ThreadEscalonador();
+            cpuThread = new ThreadCPU();
+            console = new ThreadConsole();
         }
     }
     // -------------------------------------------------------------------------------------------------------
@@ -862,22 +1034,6 @@ public class Sistema implements Runnable {
         so = new SO(hw, gerenteMem, _tamPagina);
         hw.cpu.setUtilities(so.utils); // permite cpu fazer dump de memoria ao avancar
         progs = new Programs();
-    }
-
-    // Thread do escalonador/CPU
-    public void run() {
-        try {
-            while (true) {
-                if (so.gp.rodando != null) {
-                    hw.cpu.run_one_instruction();
-                } else {
-                    // Dorme se não houver processo rodando (evita 100% de uso da CPU host)
-                    Thread.sleep(100); // 100ms
-                }
-            }
-        } catch (InterruptedException e) {
-            System.out.println("Thread do Escalonador interrompida.");
-        }
     }
 
     // CLI interativa
@@ -942,19 +1098,6 @@ public class Sistema implements Runnable {
                         so.utils.dump(inicio, fim);
                         break;
                         
-                    case "exec":
-                        if (args.length < 2) {
-                            throw new ArrayIndexOutOfBoundsException();
-                        }
-                        int execId = Integer.parseInt(args[1]);
-                        so.gp.exec(execId);
-                        break;
-                        
-                    case "execall":
-                        System.out.println("Iniciando execução escalonada de todos os processos...");
-                        so.gp.escalonar();
-                        break;
-                        
                     case "traceon":
                         hw.cpu.setDebug(true);
                         System.out.println("CPU trace ligado.");
@@ -972,8 +1115,6 @@ public class Sistema implements Runnable {
                         System.out.println("ps            - Lista todos os processos");
                         System.out.println("dump [id]     - Mostra detalhes do processo 'id'");
                         System.out.println("dumpm [ini] [fim] - Dump da memória física de 'ini' a 'fim'");
-                        System.out.println("exec [id]     - Adiciona processo para execução");
-                        System.out.println("execall       - Inicia execução escalonada de todos os processos");
                         System.out.println("traceon       - Liga trace da CPU");
                         System.out.println("traceoff      - Desliga trace da CPU");
                         System.out.println("exit          - Encerra o sistema");
@@ -1009,9 +1150,14 @@ public class Sistema implements Runnable {
     public static void main(String args[]) {
         Sistema s = new Sistema(1024, 16);  // 1024 palavras, página de 16 palavras
         
-        // Inicia thread do escalonador
-        Thread schedulerThread = new Thread(s);
-        schedulerThread.start();
+        // Inicia threads do sistema
+        Thread threadEscalonador = new Thread(s.so.escalonador);
+        Thread threadCPU = new Thread(s.so.cpuThread);
+        Thread threadConsole = new Thread(s.so.console);
+        
+        threadEscalonador.start();
+        threadCPU.start();
+        threadConsole.start();
         
         // Executa CLI no thread principal
         s.runCLI();
