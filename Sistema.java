@@ -88,21 +88,27 @@ public class Sistema implements Runnable {
 			if (rodando != null && rodando.id == id) {
 				pcb = rodando;
 				rodando = null;
-			} else {
-            	for (PCB p : prontos) {
-            	    if (p.id == id) {
-            	        pcb = p;
-            	        break;
-            	    }
-            	}
+				System.out.println("GP: Desalocando processo rodando " + id);
+			} 
+			else {
+            	Iterator<PCB> iterator = prontos.iterator();
+				while (iterator.hasNext()) {
+					PCB p = iterator.next();
+					if (p.id == id) {
+						pcb = p;
+						iterator.remove();
+						System.out.println("GP: Desalocando processo da fila " + id);
+						break;
+					}
+				}
 			}
+			
             
             // REMOVIDA a verificação de processo rodando - agora é tratado antes
             if (pcb == null) {
                 System.out.println("GP: Processo " + id + " não encontrado.");
                 return;
             }
-            prontos.remove(pcb);
             gm.desaloca(pcb.tabelaPaginas);
             pcb.estado = ProcessState.TERMINATED;
             System.out.println("GP: Processo " + id + " desalocado.");
@@ -152,12 +158,22 @@ public class Sistema implements Runnable {
         }
 
         public void escalonar() {
+			prontos.removeIf(p -> p.estado == ProcessState.TERMINATED);
+
             if (prontos.isEmpty()) {
                 rodando = null;
+				System.out.println("GP: Todos os processos terminaram. Retornando ao CLI.");
                 return;
             }
             
             PCB proximo = prontos.removeFirst();
+
+			if (proximo.estado == ProcessState.TERMINATED) {
+				System.out.println("GP: Processo " + proximo.id + " já terminado. Pulando...");
+				escalonar();
+				return;
+			}
+
             proximo.estado = ProcessState.RUNNING;
             rodando = proximo;
             
@@ -165,6 +181,12 @@ public class Sistema implements Runnable {
             hw.cpu.setContext(rodando.pc, rodando.reg, rodando.tabelaPaginas);
             
             System.out.println("GP: Escalonando processo " + rodando.id + " (" + rodando.programName + ")");
+
+			if (prontos.isEmpty() && rodando == null) {
+				System.out.println("\n=== TODOS OS PROCESSOS TERMINARAM ===");
+				System.out.println("Retornando ao prompt de comandos...");
+				System.out.print("> "); // Para manter a formatação do CLI
+			}
         }
 
         public void exec(int id) {
