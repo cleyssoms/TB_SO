@@ -1,28 +1,10 @@
 // PUCRS - Escola Politécnica - Sistemas Operacionais
 // Prof. Fernando Dotti
 // Código fornecido como parte da solução do projeto de Sistemas Operacionais
-//
-// Estrutura deste código:
-//    Todo código está dentro da classe *Sistema*
-//    Dentro de Sistema, encontra-se acima a definição de HW:
-//           Memory,  Word, 
-//           CPU tem Opcodes (codigos de operacoes suportadas na cpu),
-//               e Interrupcoes possíveis, define o que executa para cada instrucao
-//           VM -  a máquina virtual é uma instanciação de CPU e Memória
-//    Depois as definições de SW:
-//           no momento são esqueletos (so estrutura) para
-//                  InterruptHandling    e
-//                  SysCallHandling 
-//    A seguir temos utilitários para usar o sistema
-//           carga, início de execução e dump de memória
-//    Por último os programas existentes, que podem ser copiados em memória.
-//           Isto representa programas armazenados.
-//    Veja o main.  Ele instancia o Sistema com os elementos mencionados acima.
-//           em seguida solicita a execução de algum programa com  loadAndExec
 
 import java.util.*;
 
-public class Sistema {
+public class Sistema implements Runnable {
 
     // ------------------- ESTADOS DO PROCESSO -------------------
     public enum ProcessState {
@@ -108,10 +90,8 @@ public class Sistema {
                     break;
                 }
             }
-            if (rodando != null && rodando.id == id) {
-                System.out.println("GP: Erro: Não pode desalocar processo rodando.");
-                return;
-            }
+            
+            // REMOVIDA a verificação de processo rodando - agora é tratado antes
             if (pcb == null) {
                 System.out.println("GP: Processo " + id + " não encontrado.");
                 return;
@@ -165,6 +145,22 @@ public class Sistema {
             }
         }
 
+        public void escalonar() {
+            if (prontos.isEmpty()) {
+                rodando = null;
+                return;
+            }
+            
+            PCB proximo = prontos.removeFirst();
+            proximo.estado = ProcessState.RUNNING;
+            rodando = proximo;
+            
+            // Restaurar contexto do processo na CPU
+            hw.cpu.setContext(rodando.pc, rodando.reg, rodando.tabelaPaginas);
+            
+            System.out.println("GP: Escalonando processo " + rodando.id + " (" + rodando.programName + ")");
+        }
+
         public void exec(int id) {
             PCB pcb = null;
             for (PCB p : prontos) {
@@ -178,43 +174,13 @@ public class Sistema {
                 return;
             }
 
-            // Remove da fila de prontos
-            prontos.remove(pcb);
-            
-            // Configura contexto na CPU
-            hw.cpu.setTabelaPaginas(pcb.tabelaPaginas);
-            hw.cpu.setContext(pcb.pc);
-            System.arraycopy(pcb.reg, 0, hw.cpu.reg, 0, pcb.reg.length);
-            
-            pcb.estado = ProcessState.RUNNING;
-            rodando = pcb;
-            
-            System.out.println("GP: Executando processo " + id + " (" + pcb.programName + ")");
-            
-            // Executa o processo
-            hw.cpu.run();
-            
-            // Salva contexto de volta no PCB
-            pcb.pc = hw.cpu.pc;
-            System.arraycopy(hw.cpu.reg, 0, pcb.reg, 0, pcb.reg.length);
-            
-            // Limpa estado de execução
-            rodando = null;
-            pcb.estado = ProcessState.TERMINATED;
-            
-            // Desaloca memória do processo
-            gm.desaloca(pcb.tabelaPaginas);
-            System.out.println("GP: Processo " + id + " finalizado e desalocado.");
+            System.out.println("GP: Adicionando processo " + id + " (" + pcb.programName + ") para execução");
         }
     }
 
     // -------------------------------------------------------------------------------------------------------
     // --------------------- H A R D W A R E - definicoes de HW
     // ----------------------------------------------
-
-    // -------------------------------------------------------------------------------------------------------
-    // --------------------- M E M O R I A - definicoes de palavra de memoria,
-    // memória ----------------------
 
     public class Memory {
         public Word[] pos; // pos[i] é a posição i da memória. cada posição é uma palavra.
@@ -257,7 +223,7 @@ public class Sistema {
     }
 
     public enum Interrupts {           // possiveis interrupcoes que esta CPU gera
-        noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow;
+        noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow, intFimDeFatiaDeTempo;
     }
 
     // ------------------- GERENTE DE MEMÓRIA COM PAGINAÇÃO -------------------
@@ -334,6 +300,10 @@ public class Sistema {
         private int[] regTabelaPaginas;  // Tabela de páginas do processo atual
         private int tamPg;               // Tamanho da página
 
+        // Escalonamento - Quantum
+        private int instrucoesExecutadas = 0;
+        private final int DELTA_INSTRUCOES = 4; // Quantum de 4 instruções
+
         public CPU(Memory _mem, boolean _debug, int _tamPg) { // ref a MEMORIA passada na criacao da CPU
             maxInt = 32767;            // capacidade de representacao modelada
             minInt = -32767;           // se exceder deve gerar interrupcao de overflow
@@ -352,6 +322,22 @@ public class Sistema {
 
         public void setTabelaPaginas(int[] tabela) {
             this.regTabelaPaginas = tabela;
+        }
+
+        public void setContext(int _pc, int[] _reg, int[] _tabelaPaginas) {
+            this.pc = _pc;
+            this.reg = _reg;
+            this.regTabelaPaginas = _tabelaPaginas;
+            this.irpt = Interrupts.noInterrupt;
+            this.instrucoesExecutadas = 0; // Reset do contador de quantum
+        }
+
+        public int getPc() {
+            return pc;
+        }
+
+        public int[] getReg() {
+            return reg;
         }
 
         private int translate(int logicalAddress) {
@@ -406,232 +392,230 @@ public class Sistema {
             return true;
         }
 
-        public void setContext(int _pc) {                 // usado para setar o contexto da cpu para rodar um processo
-                                                          // [ nesta versao é somente colocar o PC na posicao 0 ]
-            pc = _pc;                                     // pc cfe endereco logico
-            irpt = Interrupts.noInterrupt;                // reset da interrupcao registrada
-        }
-
-        public void run() {                               // execucao da CPU supoe que o contexto da CPU, vide acima, 
-                                                          // esta devidamente setado
+        public void run_one_instruction() {                               // execucao da CPU de UMA instrução
             cpuStop = false;
-            while (!cpuStop) {      // ciclo de instrucoes. acaba cfe resultado da exec da instrucao, veja cada caso.
+            
+            // --------------------------------------------------------------------------------------------------
+            // FASE DE FETCH
+            int physPC = translate(pc);
+            if (legal(physPC)) { // pc valido
+                ir = m[physPC];  // <<<<<<<<<<<< AQUI faz FETCH - busca posicao da memoria apontada por pc, guarda em ir
+                                 // resto é dump de debug
+                if (debug) {
+                    System.out.print("                                                         regs: ");
+                    for (int i = 0; i < 10; i++) {
+                        System.out.print(" r[" + i + "]:" + reg[i]);
+                    }
+                    ;
+                    System.out.println();
+                }
+                if (debug) {
+                    System.out.print("                         pc: " + pc + "       exec: ");
+                    u.dump(ir);
+                }
 
-                // --------------------------------------------------------------------------------------------------
-                // FASE DE FETCH
-                int physPC = translate(pc);
-                if (legal(physPC)) { // pc valido
-                    ir = m[physPC];  // <<<<<<<<<<<< AQUI faz FETCH - busca posicao da memoria apontada por pc, guarda em ir
-                                     // resto é dump de debug
-                    if (debug) {
-                        System.out.print("                                                         regs: ");
-                        for (int i = 0; i < 10; i++) {
-                            System.out.print(" r[" + i + "]:" + reg[i]);
+            // --------------------------------------------------------------------------------------------------
+            // FASE DE EXECUCAO DA INSTRUCAO CARREGADA NO ir
+                switch (ir.opc) {       // conforme the opcode (código de operação) executa
+
+                    // Instrucoes de Busca e Armazenamento em Memoria
+                    case LDI: // Rd ← k        veja a tabela de instrucoes do HW simulado para entender a semantica da instrucao
+                        reg[ir.ra] = ir.p;
+                        pc++;
+                        break;
+                    case LDD: // Rd <- [A]
+                        int physAddrLDD = translate(ir.p);
+                        if (legal(physAddrLDD)) {
+                            reg[ir.ra] = m[physAddrLDD].p;
+                            pc++;
+                        }
+                        break;
+                    case LDX: // RD <- [RS] // NOVA
+                        int logicalAddrLDX = reg[ir.rb];
+                        int physAddrLDX = translate(logicalAddrLDX);
+                        if (legal(physAddrLDX)) {
+                            reg[ir.ra] = m[physAddrLDX].p;
+                            pc++;
+                        }
+                        break;
+                    case STD: // [A] ← Rs
+                        int physAddrSTD = translate(ir.p);
+                        if (legal(physAddrSTD)) {
+                            m[physAddrSTD].opc = Opcode.DATA;
+                            m[physAddrSTD].p = reg[ir.ra];
+                            pc++;
+                            if (debug) 
+                                {   System.out.print("                                                 ");   
+                                    u.dump(physAddrSTD,physAddrSTD+1);                             
+                                }
+                            }
+                        break;
+                    case STX: // [Rd] ←Rs
+                        int logicalAddrSTX = reg[ir.ra];
+                        int physAddrSTX = translate(logicalAddrSTX);
+                        if (legal(physAddrSTX)) {
+                            m[physAddrSTX].opc = Opcode.DATA;
+                            m[physAddrSTX].p = reg[ir.rb];
+                            pc++;
                         }
                         ;
-                        System.out.println();
-                    }
-                    if (debug) {
-                        System.out.print("                         pc: " + pc + "       exec: ");
-                        u.dump(ir);
-                    }
+                        break;
+                    case MOVE: // RD <- RS
+                        reg[ir.ra] = reg[ir.rb];
+                        pc++;
+                        break;
+                    // Instrucoes Aritmeticas
+                    case ADD: // Rd ← Rd + Rs
+                        reg[ir.ra] = reg[ir.ra] + reg[ir.rb];
+                        testOverflow(reg[ir.ra]);
+                        pc++;
+                        break;
+                    case ADDI: // Rd ← Rd + k
+                        reg[ir.ra] = reg[ir.ra] + ir.p;
+                        testOverflow(reg[ir.ra]);
+                        pc++;
+                        break;
+                    case SUB: // Rd ← Rd - Rs
+                        reg[ir.ra] = reg[ir.ra] - reg[ir.rb];
+                        testOverflow(reg[ir.ra]);
+                        pc++;
+                        break;
+                    case SUBI: // RD <- RD - k // NOVA
+                        reg[ir.ra] = reg[ir.ra] - ir.p;
+                        testOverflow(reg[ir.ra]);
+                        pc++;
+                        break;
+                    case MULT: // Rd <- Rd * Rs
+                        reg[ir.ra] = reg[ir.ra] * reg[ir.rb];
+                        testOverflow(reg[ir.ra]);
+                        pc++;
+                        break;
 
-                // --------------------------------------------------------------------------------------------------
-                // FASE DE EXECUCAO DA INSTRUCAO CARREGADA NO ir
-                    switch (ir.opc) {       // conforme o opcode (código de operação) executa
-
-                        // Instrucoes de Busca e Armazenamento em Memoria
-                        case LDI: // Rd ← k        veja a tabela de instrucoes do HW simulado para entender a semantica da instrucao
-                            reg[ir.ra] = ir.p;
+                    // Instrucoes JUMP
+                    case JMP: // PC <- k
+                        pc = ir.p;
+                        break;
+                    case JMPIM: // PC <- [A]
+                        int physAddrJMPIM = translate(ir.p);
+                        if (legal(physAddrJMPIM)) {
+                            pc = m[physAddrJMPIM].p;
+                        }
+                        break;
+                    case JMPIG: // If Rc > 0 Then PC ← Rs Else PC ← PC +1
+                        if (reg[ir.rb] > 0) {
+                            pc = reg[ir.ra];
+                        } else {
                             pc++;
-                            break;
-                        case LDD: // Rd <- [A]
-                            int physAddrLDD = translate(ir.p);
-                            if (legal(physAddrLDD)) {
-                                reg[ir.ra] = m[physAddrLDD].p;
-                                pc++;
-                            }
-                            break;
-                        case LDX: // RD <- [RS] // NOVA
-                            int logicalAddrLDX = reg[ir.rb];
-                            int physAddrLDX = translate(logicalAddrLDX);
-                            if (legal(physAddrLDX)) {
-                                reg[ir.ra] = m[physAddrLDX].p;
-                                pc++;
-                            }
-                            break;
-                        case STD: // [A] ← Rs
-                            int physAddrSTD = translate(ir.p);
-                            if (legal(physAddrSTD)) {
-                                m[physAddrSTD].opc = Opcode.DATA;
-                                m[physAddrSTD].p = reg[ir.ra];
-                                pc++;
-                                if (debug) 
-                                    {   System.out.print("                                                 ");   
-                                        u.dump(physAddrSTD,physAddrSTD+1);                             
-                                    }
-                                }
-                            break;
-                        case STX: // [Rd] ←Rs
-                            int logicalAddrSTX = reg[ir.ra];
-                            int physAddrSTX = translate(logicalAddrSTX);
-                            if (legal(physAddrSTX)) {
-                                m[physAddrSTX].opc = Opcode.DATA;
-                                m[physAddrSTX].p = reg[ir.rb];
-                                pc++;
-                            }
-                            ;
-                            break;
-                        case MOVE: // RD <- RS
-                            reg[ir.ra] = reg[ir.rb];
-                            pc++;
-                            break;
-                        // Instrucoes Aritmeticas
-                        case ADD: // Rd ← Rd + Rs
-                            reg[ir.ra] = reg[ir.ra] + reg[ir.rb];
-                            testOverflow(reg[ir.ra]);
-                            pc++;
-                            break;
-                        case ADDI: // Rd ← Rd + k
-                            reg[ir.ra] = reg[ir.ra] + ir.p;
-                            testOverflow(reg[ir.ra]);
-                            pc++;
-                            break;
-                        case SUB: // Rd ← Rd - Rs
-                            reg[ir.ra] = reg[ir.ra] - reg[ir.rb];
-                            testOverflow(reg[ir.ra]);
-                            pc++;
-                            break;
-                        case SUBI: // RD <- RD - k // NOVA
-                            reg[ir.ra] = reg[ir.ra] - ir.p;
-                            testOverflow(reg[ir.ra]);
-                            pc++;
-                            break;
-                        case MULT: // Rd <- Rd * Rs
-                            reg[ir.ra] = reg[ir.ra] * reg[ir.rb];
-                            testOverflow(reg[ir.ra]);
-                            pc++;
-                            break;
-
-                        // Instrucoes JUMP
-                        case JMP: // PC <- k
+                        }
+                        break;
+                    case JMPIGK: // If RC > 0 then PC <- k else PC++
+                        if (reg[ir.rb] > 0) {
                             pc = ir.p;
-                            break;
-                        case JMPIM: // PC <- [A]
-                            int physAddrJMPIM = translate(ir.p);
-                            if (legal(physAddrJMPIM)) {
-                                pc = m[physAddrJMPIM].p;
-                            }
-                            break;
-                        case JMPIG: // If Rc > 0 Then PC ← Rs Else PC ← PC +1
-                            if (reg[ir.rb] > 0) {
-                                pc = reg[ir.ra];
-                            } else {
-                                pc++;
-                            }
-                            break;
-                        case JMPIGK: // If RC > 0 then PC <- k else PC++
-                            if (reg[ir.rb] > 0) {
-                                pc = ir.p;
-                            } else {
-                                pc++;
-                            }
-                            break;
-                        case JMPILK: // If RC < 0 then PC <- k else PC++
-                            if (reg[ir.rb] < 0) {
-                                pc = ir.p;
-                            } else {
-                                pc++;
-                            }
-                            break;
-                        case JMPIEK: // If RC = 0 then PC <- k else PC++
-                            if (reg[ir.rb] == 0) {
-                                pc = ir.p;
-                            } else {
-                                pc++;
-                            }
-                            break;
-                        case JMPIL: // if Rc < 0 then PC <- Rs Else PC <- PC +1
-                            if (reg[ir.rb] < 0) {
-                                pc = reg[ir.ra];
-                            } else {
-                                pc++;
-                            }
-                            break;
-                        case JMPIE: // If Rc = 0 Then PC <- Rs Else PC <- PC +1
-                            if (reg[ir.rb] == 0) {
-                                pc = reg[ir.ra];
-                            } else {
-                                pc++;
-                            }
-                            break;
-                        case JMPIGM: // If RC > 0 then PC <- [A] else PC++
-                            int physAddrJMPIGM = translate(ir.p);
-                            if (legal(physAddrJMPIGM)){
-                                if (reg[ir.rb] > 0) {
-                                   pc = m[physAddrJMPIGM].p;
-                                } else {
-                                    pc++;
-                               }
-                            }
-                            break;
-                        case JMPILM: // If RC < 0 then PC <- k else PC++
-                            int physAddrJMPILM = translate(ir.p);
-                            if (legal(physAddrJMPILM)) {
-                                if (reg[ir.rb] < 0) {
-                                    pc = m[physAddrJMPILM].p;
-                                } else {
-                                    pc++;
-                                }
-                            }
-                            break;
-                        case JMPIEM: // If RC = 0 then PC <- k else PC++
-                            int physAddrJMPIEM = translate(ir.p);
-                            if (legal(physAddrJMPIEM)) {
-                                if (reg[ir.rb] == 0) {
-                                    pc = m[physAddrJMPIEM].p;
-                                } else {
-                                    pc++;
-                                }
-                            }
-                            break;
-                        case JMPIGT: // If RS>RC then PC <- k else PC++
-                            if (reg[ir.ra] > reg[ir.rb]) {
-                                pc = ir.p;
-                            } else {
-                                pc++;
-                            }
-                            break;
-
-                        case DATA: // pc está sobre área supostamente de dados
-                            irpt = Interrupts.intInstrucaoInvalida;
-                            break;
-
-                        // Chamadas de sistema
-                        case SYSCALL:
-                            sysCall.handle(); // <<<<< aqui desvia para rotina de chamada de sistema, no momento so
-                                                  // temos IO
+                        } else {
                             pc++;
-                            break;
+                        }
+                        break;
+                    case JMPILK: // If RC < 0 then PC <- k else PC++
+                        if (reg[ir.rb] < 0) {
+                            pc = ir.p;
+                        } else {
+                            pc++;
+                        }
+                        break;
+                    case JMPIEK: // If RC = 0 then PC <- k else PC++
+                        if (reg[ir.rb] == 0) {
+                            pc = ir.p;
+                        } else {
+                            pc++;
+                        }
+                        break;
+                    case JMPIL: // if Rc < 0 then PC <- Rs Else PC <- PC +1
+                        if (reg[ir.rb] < 0) {
+                            pc = reg[ir.ra];
+                        } else {
+                            pc++;
+                        }
+                        break;
+                    case JMPIE: // If Rc = 0 Then PC <- Rs Else PC <- PC +1
+                        if (reg[ir.rb] == 0) {
+                            pc = reg[ir.ra];
+                        } else {
+                            pc++;
+                        }
+                        break;
+                    case JMPIGM: // If RC > 0 then PC <- [A] else PC++
+                        int physAddrJMPIGM = translate(ir.p);
+                        if (legal(physAddrJMPIGM)){
+                            if (reg[ir.rb] > 0) {
+                               pc = m[physAddrJMPIGM].p;
+                            } else {
+                                pc++;
+                           }
+                        }
+                        break;
+                    case JMPILM: // If RC < 0 then PC <- k else PC++
+                        int physAddrJMPILM = translate(ir.p);
+                        if (legal(physAddrJMPILM)) {
+                            if (reg[ir.rb] < 0) {
+                                pc = m[physAddrJMPILM].p;
+                            } else {
+                                pc++;
+                            }
+                        }
+                        break;
+                    case JMPIEM: // If RC = 0 then PC <- k else PC++
+                        int physAddrJMPIEM = translate(ir.p);
+                        if (legal(physAddrJMPIEM)) {
+                            if (reg[ir.rb] == 0) {
+                                pc = m[physAddrJMPIEM].p;
+                            } else {
+                                pc++;
+                            }
+                        }
+                        break;
+                    case JMPIGT: // If RS>RC then PC <- k else PC++
+                        if (reg[ir.ra] > reg[ir.rb]) {
+                            pc = ir.p;
+                        } else {
+                            pc++;
+                        }
+                        break;
 
-                        case STOP: // por enquanto, para execucao
-                            sysCall.stop();
-                            cpuStop = true;
-                            break;
+                    case DATA: // pc está sobre área supostamente de dados
+                        irpt = Interrupts.intInstrucaoInvalida;
+                        break;
 
-                        // Inexistente
-                        default:
-                            irpt = Interrupts.intInstrucaoInvalida;
-                            break;
-                    }
+                    // Chamadas de sistema
+                    case SYSCALL:
+                        sysCall.handle(); // <<<<< aqui desvia para rotina de chamada de sistema, no momento so
+                                              // temos IO
+                        pc++;
+                        break;
+
+                    case STOP: // por enquanto, para execucao
+                        sysCall.stop();
+                        cpuStop = true;
+                        break;
+
+                    // Inexistente
+                    default:
+                        irpt = Interrupts.intInstrucaoInvalida;
+                        break;
                 }
-                // --------------------------------------------------------------------------------------------------
-                // VERIFICA INTERRUPÇÃO !!! - TERCEIRA FASE DO CICLO DE INSTRUÇÕES
-                if (irpt != Interrupts.noInterrupt) { // existe interrupção
-                    ih.handle(irpt);                  // desvia para rotina de tratamento - esta rotina é do SO
-                    cpuStop = true;                   // nesta versao, para a CPU
-                }
-            } // FIM DO CICLO DE UMA INSTRUÇÃO
+            }
+            
+            // Controle do Quantum - Preempção
+            instrucoesExecutadas++;
+            if (instrucoesExecutadas >= DELTA_INSTRUCOES) {
+                irpt = Interrupts.intFimDeFatiaDeTempo;
+            }
+            
+            // --------------------------------------------------------------------------------------------------
+            // VERIFICA INTERRUPÇÃO !!! - TERCEIRA FASE DO CICLO DE INSTRUÇÕES
+            if (irpt != Interrupts.noInterrupt) { // existe interrupção
+                ih.handle(irpt);                  // desvia para rotina de tratamento - esta rotina é do SO
+                cpuStop = true;                   // nesta versao, para a CPU
+            }
         }
     }
     // ------------------ C P U - fim
@@ -674,9 +658,35 @@ public class Sistema {
         }
 
         public void handle(Interrupts irpt) {
-            // apenas avisa - todas interrupcoes neste momento finalizam o programa
-            System.out.println(
-                    "                                                         Interrupcao " + irpt + "   pc: " + so.hw.cpu.pc);
+            switch (irpt) {
+                case intFimDeFatiaDeTempo:
+                    PCB anterior = so.gp.rodando;
+                    if (anterior != null) {
+                        // Salvar contexto no PCB
+                        anterior.pc = so.hw.cpu.getPc();
+                        // Registradores já estão salvos por referência
+                        anterior.estado = ProcessState.READY;
+                        // Devolver para o FIM da fila
+                        so.gp.prontos.addLast(anterior);
+                        System.out.println("IH: Preempção - Processo " + anterior.id + " retorna para fila");
+                    }
+                    so.gp.escalonar();
+                    break;
+                    
+                case intEnderecoInvalido:
+                case intInstrucaoInvalida:
+                case intOverflow:
+                    System.out.println("!!!! ERRO FATAL no Processo " + so.gp.rodando.id + ": " + irpt);
+                    PCB processoComErro = so.gp.rodando;
+                    so.gp.rodando = null;
+                    so.gp.desalocaProcesso(processoComErro.id);
+                    so.gp.escalonar();
+                    break;
+                    
+                default:
+                    System.out.println("IH: Interrupção não tratada: " + irpt);
+                    break;
+            }
         }
     }
 
@@ -692,8 +702,11 @@ public class Sistema {
         }
 
         public void stop() { // chamada de sistema indicando final de programa
-                             // nesta versao cpu simplesmente pára
-            System.out.println("                                                         SYSCALL STOP");
+            System.out.println("    > SYSCALL STOP: Processo " + so.gp.rodando.id + " terminado.");
+            PCB processoTerminado = so.gp.rodando;
+            so.gp.rodando = null;
+            so.gp.desalocaProcesso(processoTerminado.id);
+            so.gp.escalonar();
         }
 
         public void handle() { // chamada de sistema 
@@ -780,9 +793,9 @@ public class Sistema {
             loadProgram(p); // carga do programa na memoria
             System.out.println("---------------------------------- programa carregado na memoria");
             dump(0, p.length); // dump da memoria nestas posicoes
-            hw.cpu.setContext(0); // seta pc para endereço 0 - ponto de entrada dos programas
+            hw.cpu.setContext(0, new int[10], null); // seta pc para endereço 0 - ponto de entrada dos programas
             System.out.println("---------------------------------- inicia execucao ");
-            hw.cpu.run(); // cpu roda programa ate parar
+            hw.cpu.run_one_instruction(); // cpu roda programa ate parar
             System.out.println("---------------------------------- memoria após execucao ");
             dump(0, p.length); // dump da memoria com resultado
         }
@@ -823,7 +836,24 @@ public class Sistema {
         progs = new Programs();
     }
 
+    // Thread do escalonador/CPU
     public void run() {
+        try {
+            while (true) {
+                if (so.gp.rodando != null) {
+                    hw.cpu.run_one_instruction();
+                } else {
+                    // Dorme se não houver processo rodando (evita 100% de uso da CPU host)
+                    Thread.sleep(100); // 100ms
+                }
+            }
+        } catch (InterruptedException e) {
+            System.out.println("Thread do Escalonador interrompida.");
+        }
+    }
+
+    // CLI interativa
+    public void runCLI() {
         System.out.println("Sistema Operacional iniciado. Digite 'help' para comandos.");
         Scanner scanner = new Scanner(System.in);
         
@@ -892,6 +922,11 @@ public class Sistema {
                         so.gp.exec(execId);
                         break;
                         
+                    case "execall":
+                        System.out.println("Iniciando execução escalonada de todos os processos...");
+                        so.gp.escalonar();
+                        break;
+                        
                     case "traceon":
                         hw.cpu.setDebug(true);
                         System.out.println("CPU trace ligado.");
@@ -909,7 +944,8 @@ public class Sistema {
                         System.out.println("ps            - Lista todos os processos");
                         System.out.println("dump [id]     - Mostra detalhes do processo 'id'");
                         System.out.println("dumpm [ini] [fim] - Dump da memória física de 'ini' a 'fim'");
-                        System.out.println("exec [id]     - Executa processo 'id'");
+                        System.out.println("exec [id]     - Adiciona processo para execução");
+                        System.out.println("execall       - Inicia execução escalonada de todos os processos");
                         System.out.println("traceon       - Liga trace da CPU");
                         System.out.println("traceoff      - Desliga trace da CPU");
                         System.out.println("exit          - Encerra o sistema");
@@ -944,7 +980,13 @@ public class Sistema {
     // ------------------- instancia e testa sistema
     public static void main(String args[]) {
         Sistema s = new Sistema(1024, 16);  // 1024 palavras, página de 16 palavras
-        s.run();
+        
+        // Inicia thread do escalonador
+        Thread schedulerThread = new Thread(s);
+        schedulerThread.start();
+        
+        // Executa CLI no thread principal
+        s.runCLI();
     }
 
     // -------------------------------------------------------------------------------------------------------
