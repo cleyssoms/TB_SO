@@ -121,6 +121,91 @@ public class Sistema {
             pcb.estado = ProcessState.TERMINATED;
             System.out.println("GP: Processo " + id + " desalocado.");
         }
+
+        public void ps() {
+            System.out.println("=== LISTA DE PROCESSOS ===");
+            System.out.println("ID\tEstado\t\tPrograma");
+            if (rodando != null) {
+                System.out.println(rodando.id + "\tRUNNING\t\t" + rodando.programName);
+            }
+            for (PCB p : prontos) {
+                System.out.println(p.id + "\tREADY\t\t" + p.programName);
+            }
+            if (rodando == null && prontos.isEmpty()) {
+                System.out.println("Nenhum processo ativo.");
+            }
+        }
+
+        public void dump(int id) {
+            PCB pcb = null;
+            if (rodando != null && rodando.id == id) {
+                pcb = rodando;
+            } else {
+                for (PCB p : prontos) {
+                    if (p.id == id) {
+                        pcb = p;
+                        break;
+                    }
+                }
+            }
+            if (pcb == null) {
+                System.out.println("GP: Processo " + id + " não encontrado.");
+                return;
+            }
+            System.out.println("=== DUMP DO PROCESSO " + id + " (" + pcb.programName + ") ===");
+            System.out.println("PC: " + pcb.pc);
+            System.out.println("Estado: " + pcb.estado);
+            System.out.println("Registradores:");
+            for (int i = 0; i < pcb.reg.length; i++) {
+                System.out.println("  r[" + i + "]: " + pcb.reg[i]);
+            }
+            System.out.println("Tabela de Páginas:");
+            for (int i = 0; i < pcb.tabelaPaginas.length; i++) {
+                System.out.println("  Página " + i + " -> Frame " + pcb.tabelaPaginas[i]);
+            }
+        }
+
+        public void exec(int id) {
+            PCB pcb = null;
+            for (PCB p : prontos) {
+                if (p.id == id) {
+                    pcb = p;
+                    break;
+                }
+            }
+            if (pcb == null) {
+                System.out.println("GP: Processo " + id + " não encontrado na fila de prontos.");
+                return;
+            }
+
+            // Remove da fila de prontos
+            prontos.remove(pcb);
+            
+            // Configura contexto na CPU
+            hw.cpu.setTabelaPaginas(pcb.tabelaPaginas);
+            hw.cpu.setContext(pcb.pc);
+            System.arraycopy(pcb.reg, 0, hw.cpu.reg, 0, pcb.reg.length);
+            
+            pcb.estado = ProcessState.RUNNING;
+            rodando = pcb;
+            
+            System.out.println("GP: Executando processo " + id + " (" + pcb.programName + ")");
+            
+            // Executa o processo
+            hw.cpu.run();
+            
+            // Salva contexto de volta no PCB
+            pcb.pc = hw.cpu.pc;
+            System.arraycopy(hw.cpu.reg, 0, pcb.reg, 0, pcb.reg.length);
+            
+            // Limpa estado de execução
+            rodando = null;
+            pcb.estado = ProcessState.TERMINATED;
+            
+            // Desaloca memória do processo
+            gm.desaloca(pcb.tabelaPaginas);
+            System.out.println("GP: Processo " + id + " finalizado e desalocado.");
+        }
     }
 
     // -------------------------------------------------------------------------------------------------------
@@ -259,6 +344,10 @@ public class Sistema {
             tamPg = _tamPg;            // tamanho da página para MMU
             regTabelaPaginas = null;   // inicialmente sem tabela de páginas
 
+        }
+
+        public void setDebug(boolean _debug) {
+            debug = _debug;
         }
 
         public void setTabelaPaginas(int[] tabela) {
@@ -587,7 +676,7 @@ public class Sistema {
         public void handle(Interrupts irpt) {
             // apenas avisa - todas interrupcoes neste momento finalizam o programa
             System.out.println(
-                    "                                                         Interrupcao " + irpt + "   pc: " + so.hw.cpu.pc);
+                    "                                                         Interrupcao " + irpt + "   pc: " + so.utils.hw.cpu.pc);
         }
     }
 
@@ -704,10 +793,8 @@ public class Sistema {
         public SysCallHandling sc;
         public Utilities utils;
         public GerenteProcessos gp;
-        public HW hw;
 
         public SO(HW hw, GerenteMemoria gm, int tamPg) {
-            this.hw = hw;
             utils = new Utilities(hw, gm);
             gp = new GerenteProcessos(hw, gm, tamPg, utils);
             ih = new InterruptHandling(this);
@@ -735,17 +822,117 @@ public class Sistema {
     }
 
     public void run() {
-
-        so.utils.loadAndExec(progs.retrieveProgram("fatorialV2"));
-
-        // so.utils.loadAndExec(progs.retrieveProgram("fatorial"));
-        // fibonacci10,
-        // fibonacci10v2,
-        // progMinimo,
-        // fatorialWRITE, // saida
-        // fibonacciREAD, // entrada
-        // PB
-        // PC, // bubble sort
+        System.out.println("Sistema Operacional iniciado. Digite 'help' para comandos.");
+        Scanner scanner = new Scanner(System.in);
+        
+        while (true) {
+            System.out.print("> ");
+            String line = scanner.nextLine().trim();
+            
+            if (line.isEmpty()) {
+                continue;
+            }
+            
+            String[] args = line.split("\\s+");
+            String cmd = args[0].toLowerCase();
+            
+            try {
+                switch (cmd) {
+                    case "new":
+                        if (args.length < 2) {
+                            throw new ArrayIndexOutOfBoundsException();
+                        }
+                        Program p = progs.retrieveProgram(args[1]);
+                        if (p == null) {
+                            System.out.println("Erro: Programa '" + args[1] + "' não encontrado.");
+                        } else {
+                            boolean sucesso = so.gp.criaProcesso(p);
+                            if (!sucesso) {
+                                System.out.println("Erro: Falha ao criar processo (provavelmente sem memória).");
+                            }
+                        }
+                        break;
+                        
+                    case "rm":
+                        if (args.length < 2) {
+                            throw new ArrayIndexOutOfBoundsException();
+                        }
+                        int id = Integer.parseInt(args[1]);
+                        so.gp.desalocaProcesso(id);
+                        break;
+                        
+                    case "ps":
+                        so.gp.ps();
+                        break;
+                        
+                    case "dump":
+                        if (args.length < 2) {
+                            throw new ArrayIndexOutOfBoundsException();
+                        }
+                        int dumpId = Integer.parseInt(args[1]);
+                        so.gp.dump(dumpId);
+                        break;
+                        
+                    case "dumpm":
+                        if (args.length < 3) {
+                            throw new ArrayIndexOutOfBoundsException();
+                        }
+                        int inicio = Integer.parseInt(args[1]);
+                        int fim = Integer.parseInt(args[2]);
+                        so.utils.dump(inicio, fim);
+                        break;
+                        
+                    case "exec":
+                        if (args.length < 2) {
+                            throw new ArrayIndexOutOfBoundsException();
+                        }
+                        int execId = Integer.parseInt(args[1]);
+                        so.gp.exec(execId);
+                        break;
+                        
+                    case "traceon":
+                        hw.cpu.setDebug(true);
+                        System.out.println("CPU trace ligado.");
+                        break;
+                        
+                    case "traceoff":
+                        hw.cpu.setDebug(false);
+                        System.out.println("CPU trace desligado.");
+                        break;
+                        
+                    case "help":
+                        System.out.println("=== COMANDOS DISPONÍVEIS ===");
+                        System.out.println("new [prog]    - Cria novo processo com programa 'prog'");
+                        System.out.println("rm [id]       - Remove processo com ID 'id'");
+                        System.out.println("ps            - Lista todos os processos");
+                        System.out.println("dump [id]     - Mostra detalhes do processo 'id'");
+                        System.out.println("dumpm [ini] [fim] - Dump da memória física de 'ini' a 'fim'");
+                        System.out.println("exec [id]     - Executa processo 'id'");
+                        System.out.println("traceon       - Liga trace da CPU");
+                        System.out.println("traceoff      - Desliga trace da CPU");
+                        System.out.println("exit          - Encerra o sistema");
+                        System.out.println("help          - Mostra esta ajuda");
+                        break;
+                        
+                    case "exit":
+                        System.out.println("Encerrando sistema...");
+                        scanner.close();
+                        System.exit(0);
+                        break;
+                        
+                    default:
+                        System.out.println("Erro: Comando '" + cmd + "' não reconhecido. Digite 'help'.");
+                        break;
+                }
+            } catch (NumberFormatException e) {
+                System.out.println("Erro: Argumento inválido. Esperava um número (ID ou endereço).");
+            } catch (ArrayIndexOutOfBoundsException e) {
+                System.out.println("Erro: Faltam argumentos para o comando '" + cmd + "'. Digite 'help'.");
+            } catch (Exception e) {
+                System.out.println("Erro inesperado: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
     }
     // ------------------- S I S T E M A - fim
     // --------------------------------------------------------------
@@ -777,10 +964,10 @@ public class Sistema {
 
     public class Programs {
 
-        public Word[] retrieveProgram(String pname) {
+        public Program retrieveProgram(String pname) {
             for (Program p : progs) {
-                if (p != null & p.name == pname)
-                    return p.image;
+                if (p != null && p.name.equals(pname))
+                    return p;
             }
             return null;
         }
