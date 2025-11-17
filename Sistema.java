@@ -676,7 +676,7 @@ public class Sistema {
         public void handle(Interrupts irpt) {
             // apenas avisa - todas interrupcoes neste momento finalizam o programa
             System.out.println(
-                    "                                                         Interrupcao " + irpt + "   pc: " + so.utils.hw.cpu.pc);
+                    "                                                         Interrupcao " + irpt + "   pc: " + so.hw.cpu.pc);
         }
     }
 
@@ -793,8 +793,10 @@ public class Sistema {
         public SysCallHandling sc;
         public Utilities utils;
         public GerenteProcessos gp;
+        public HW hw;
 
         public SO(HW hw, GerenteMemoria gm, int tamPg) {
+            this.hw = hw;
             utils = new Utilities(hw, gm);
             gp = new GerenteProcessos(hw, gm, tamPg, utils);
             ih = new InterruptHandling(this);
