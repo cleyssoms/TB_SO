@@ -84,12 +84,18 @@ public class Sistema implements Runnable {
         public void desalocaProcesso(int id) {
             // Procura o PCB na fila de prontos
             PCB pcb = null;
-            for (PCB p : prontos) {
-                if (p.id == id) {
-                    pcb = p;
-                    break;
-                }
-            }
+
+			if (rodando != null && rodando.id == id) {
+				pcb = rodando;
+				rodando = null;
+			} else {
+            	for (PCB p : prontos) {
+            	    if (p.id == id) {
+            	        pcb = p;
+            	        break;
+            	    }
+            	}
+			}
             
             // REMOVIDA a verificação de processo rodando - agora é tratado antes
             if (pcb == null) {
